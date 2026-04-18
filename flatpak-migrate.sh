@@ -7,14 +7,16 @@
 #      'fedora' remote) from Flathub instead.
 #   C. Removes any non-Flathub remote that has nothing installed from it
 #      after the migration.
+#   D. Replaces GNOME Software with Bazaar (io.github.kolunmi.Bazaar).
 #
-# Each phase is a self-contained 5-step flow:
-#   1. Scan    2. Resolve    3. Review/edit plan    4. Confirm    5. Execute
+# Each phase is a self-contained flow: scan -> resolve -> (review) ->
+# confirm -> execute.
 #
 # Usage:
-#   ./flatpak-migrate.sh                    # run all three phases (default)
+#   ./flatpak-migrate.sh                    # run all four phases (default)
 #   ./flatpak-migrate.sh --skip-rpm         # skip Phase A
 #   ./flatpak-migrate.sh --skip-remotes     # skip Phase B and C
+#   ./flatpak-migrate.sh --skip-bazaar      # skip Phase D
 #   ./flatpak-migrate.sh --auto-remove      # remove RPM after Flatpak install
 #   ./flatpak-migrate.sh --no-edit          # skip editor, keep confirmation
 #   ./flatpak-migrate.sh --yes              # non-interactive, accept all
@@ -22,6 +24,8 @@
 #
 # Flatpak user data in ~/.var/app/<app-id>/ is preserved across the
 # uninstall/reinstall in Phase B.
+# On rpm-ostree systems (Silverblue/Kinoite/Bluefin) Phase D uses
+# 'rpm-ostree override remove'; changes take effect after reboot.
 
 set -euo pipefail
 
@@ -31,6 +35,7 @@ DO_EDIT=1
 DRY_RUN=0
 SKIP_RPM=0
 SKIP_REMOTES=0
+SKIP_BAZAAR=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -40,8 +45,9 @@ for arg in "$@"; do
     --dry-run)       DRY_RUN=1 ;;
     --skip-rpm)      SKIP_RPM=1 ;;
     --skip-remotes)  SKIP_REMOTES=1 ;;
+    --skip-bazaar)   SKIP_BAZAAR=1 ;;
     --help|-h)
-      sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown argument: $arg" >&2; exit 2 ;;
@@ -94,6 +100,62 @@ edit_plan() {
   [[ "$before" != "$after" ]]
 }
 
+# --- Flathub app-id resolver -----------------------------------------------
+# Populated once after prereqs: one app-id per line, apps only (no runtimes).
+FLATHUB_APPS=""
+
+appid_exists() {
+  # Exact full-line fixed-string match against the cached Flathub app list.
+  [[ -n "$FLATHUB_APPS" ]] && grep -qFx "$1" <<< "$FLATHUB_APPS"
+}
+
+# "text-editor" -> "TextEditor"
+to_pascal() {
+  local part out="" IFS=-
+  read -ra parts <<< "$1"
+  for part in "${parts[@]}"; do out+="${part^}"; done
+  printf '%s' "$out"
+}
+
+# Resolve an RPM name to a Flathub app-id. Echoes the id on success, "" on
+# failure. Tries: curated map -> naming-convention heuristics -> display-name
+# search on Flathub. Every returned id is verified to exist on Flathub.
+resolve_appid() {
+  local pkg="$1" stem pascal cand result
+  local -a candidates=()
+
+  # Packages handled by a later phase or unsuitable for Flatpak replacement
+  case "$pkg" in
+    gnome-software) return ;;   # Phase D replaces with Bazaar
+  esac
+
+  # 1. Curated map wins
+  if [[ -n "${MAP[$pkg]:-}" ]]; then
+    printf '%s' "${MAP[$pkg]}"; return
+  fi
+
+  # 2. Convention-based candidates
+  if [[ "$pkg" == gnome-* ]]; then
+    stem="${pkg#gnome-}"
+    pascal=$(to_pascal "$stem")
+    candidates+=( "org.gnome.$pascal" "org.gnome.${stem^}" "org.gnome.$stem" )
+  elif [[ "$pkg" == kde-* ]]; then
+    stem="${pkg#kde-}"
+    candidates+=( "org.kde.$stem" "org.kde.$(to_pascal "$stem")" )
+  fi
+
+  for cand in "${candidates[@]}"; do
+    if appid_exists "$cand"; then printf '%s' "$cand"; return; fi
+  done
+
+  # 3. Last resort: exact display-name match on Flathub search
+  result=$(flatpak search --columns=name,application "$pkg" 2>/dev/null \
+           | awk -F'\t' -v p="$pkg" 'tolower($1)==tolower(p){print $2; exit}')
+  if [[ -n "$result" ]] && appid_exists "$result"; then
+    printf '%s' "$result"; return
+  fi
+}
+
 # --- Parse an edited plan file into arrays:
 #       _FINAL=("name|target" ...)    kept lines
 #       _EXCLUDED=("name -> target" ...)   commented-out lines
@@ -140,6 +202,14 @@ fi
 ok "Prerequisites OK."
 info "Log: $LOG"
 
+step "Caching Flathub app index"
+FLATHUB_APPS=$(flatpak remote-ls flathub --app --columns=application 2>/dev/null || true)
+if [[ -z "$FLATHUB_APPS" ]]; then
+  warn "Flathub index is empty (offline? fresh remote?); resolver will be less accurate."
+else
+  info "$(wc -l <<< "$FLATHUB_APPS") apps on Flathub."
+fi
+
 # ===========================================================================
 # Curated RPM name -> Flathub app-id map (Phase A)
 # ===========================================================================
@@ -182,6 +252,17 @@ declare -A MAP=(
   [evince]=org.gnome.Evince
   [gedit]=org.gnome.gedit
   [simple-scan]=org.gnome.SimpleScan
+  [gnome-text-editor]=org.gnome.TextEditor
+  [gnome-characters]=org.gnome.Characters
+  [gnome-connections]=org.gnome.Connections
+  [gnome-logs]=org.gnome.Logs
+  [gnome-font-viewer]=org.gnome.font-viewer
+  [snapshot]=org.gnome.Snapshot
+  [loupe]=org.gnome.Loupe
+  [papers]=org.gnome.Papers
+
+  # Fedora-published apps
+  [mediawriter]=org.fedoraproject.MediaWriter
   [transmission-gtk]=com.transmissionbt.Transmission
   [steam]=com.valvesoftware.Steam
 )
@@ -210,12 +291,8 @@ do_phase_a() {
   local -a MATCHES=() UNMATCHED=() ALREADY=()
   local pkg appid
   for pkg in "${GUI_RPMS[@]}"; do
-    appid="${MAP[$pkg]:-}"
+    appid=$(resolve_appid "$pkg")
     if [[ -z "$appid" ]]; then
-      appid=$(flatpak search --columns=name,application "$pkg" 2>/dev/null \
-              | awk -F'\t' -v p="$pkg" 'tolower($1)==tolower(p){print $2; exit}')
-    fi
-    if [[ -z "$appid" ]] || ! flatpak remote-info flathub "$appid" >/dev/null 2>&1; then
       UNMATCHED+=("$pkg"); continue
     fi
     if flatpak info "$appid" >/dev/null 2>&1; then
@@ -442,10 +519,103 @@ do_phase_c() {
 }
 
 # ===========================================================================
+# PHASE D: Replace GNOME Software with Bazaar
+# ===========================================================================
+BAZAAR_APPID="io.github.kolunmi.Bazaar"
+
+do_phase_d() {
+  phase "PHASE D: Replace GNOME Software with Bazaar"
+
+  step "Step D1/3: Checking current state"
+  local has_gs=0 has_bazaar=0 use_ostree=0
+
+  if rpm -q gnome-software >/dev/null 2>&1; then
+    has_gs=1
+    info "GNOME Software RPM is installed."
+  else
+    info "GNOME Software RPM is not installed."
+  fi
+
+  if flatpak info "$BAZAAR_APPID" >/dev/null 2>&1; then
+    has_bazaar=1
+    info "Bazaar is already installed as a Flatpak."
+  else
+    info "Bazaar is not installed."
+  fi
+
+  if command -v rpm-ostree >/dev/null 2>&1 && rpm-ostree status >/dev/null 2>&1; then
+    use_ostree=1
+    warn "Detected rpm-ostree system; removal will use 'override remove' and require a reboot."
+  fi
+
+  if [[ $has_gs -eq 0 && $has_bazaar -eq 1 ]]; then
+    ok "Nothing to do — GNOME Software already gone, Bazaar already present."
+    return 0
+  fi
+
+  if ! appid_exists "$BAZAAR_APPID"; then
+    err "$BAZAAR_APPID was not found on Flathub. Skipping."
+    return 0
+  fi
+
+  step "Step D2/3: Plan"
+  [[ $has_bazaar -eq 0 ]] && \
+    printf '   %s+%s install  %s (from Flathub)\n' \
+      "$c_green" "$c_reset" "$BAZAAR_APPID"
+  if [[ $has_gs -eq 1 ]]; then
+    if [[ $use_ostree -eq 1 ]]; then
+      printf '   %s-%s remove   gnome-software (via rpm-ostree override, reboot required)\n' \
+        "$c_red" "$c_reset"
+    else
+      printf '   %s-%s remove   gnome-software (via dnf)\n' "$c_red" "$c_reset"
+    fi
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo; ok "Dry run — no changes made."; return 0
+  fi
+
+  echo
+  confirm "Proceed with Phase D?" || { warn "Skipped Phase D."; return 0; }
+
+  step "Step D3/3: Executing"
+  # Install Bazaar FIRST so the user is never without an app store
+  if [[ $has_bazaar -eq 0 ]]; then
+    info "Installing $BAZAAR_APPID..."
+    if ! flatpak install -y --noninteractive flathub "$BAZAAR_APPID"; then
+      err "Failed to install Bazaar; leaving gnome-software in place."
+      return 1
+    fi
+    ok "Installed Bazaar."
+  fi
+
+  # Now remove GNOME Software
+  if [[ $has_gs -eq 1 ]]; then
+    if [[ $use_ostree -eq 1 ]]; then
+      info "Removing gnome-software via rpm-ostree override..."
+      if sudo rpm-ostree override remove gnome-software; then
+        ok "Removed gnome-software. Reboot to apply."
+      else
+        warn "rpm-ostree override remove failed."
+      fi
+    else
+      info "Removing gnome-software RPM..."
+      if sudo dnf remove -y gnome-software; then
+        ok "Removed gnome-software."
+      else
+        warn "Could not remove gnome-software (pulled in by another package?)."
+      fi
+    fi
+  fi
+  ok "Phase D complete."
+}
+
+# ===========================================================================
 # Main
 # ===========================================================================
 [[ $SKIP_RPM     -eq 0 ]] && do_phase_a
 [[ $SKIP_REMOTES -eq 0 ]] && { do_phase_b; do_phase_c; }
+[[ $SKIP_BAZAAR  -eq 0 ]] && do_phase_d
 
 echo
 ok "All done. Log: $LOG"
